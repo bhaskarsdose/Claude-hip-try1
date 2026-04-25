@@ -10,11 +10,8 @@ SimpleITK>=2.3
 scikit-image>=0.22
 trimesh>=4.0
 
-# Web backend
-fastapi>=0.110
-uvicorn[standard]>=0.27
-python-multipart>=0.0.9
-aiofiles>=23.2
+# Inline 3D visualisation in Colab
+plotly>=5.20
 
 # Logging / experiments
 tensorboard>=2.15
