@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data and models (large, not committed). Anchored with leading "/" so these
+# only match the top-level directories — `src/hip_recon/data/` and
+# `src/hip_recon/models/` (the source packages) are NOT ignored.
+/data/
+/models/
+/runs/
+/outputs/
+*.nii
+*.nii.gz
+*.stl
+*.ply
+*.obj
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Allow tests' tiny fixtures even with the broad ignores above
+!tests/fixtures/**
