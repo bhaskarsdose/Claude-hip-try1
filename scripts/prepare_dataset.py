@@ -10,11 +10,14 @@ For each `*.nii.gz` mask under --in-dir we:
 
 Usage:
     python scripts/prepare_dataset.py --in-dir data/raw/ctpelvic1k/labels
+    python scripts/prepare_dataset.py --in-dir data/raw --out-dir data/processed --label 2 --workers 4
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import nibabel as nib
@@ -35,6 +38,30 @@ def _binarise(arr: np.ndarray, keep_label: int | None) -> np.ndarray:
     return (arr == keep_label).astype(np.float32)
 
 
+def _process_one(args_tuple) -> tuple[str, str | None]:
+    """Process a single NIfTI file. Returns (filename, error_or_None)."""
+    f, out_dir, keep_label, grid = args_tuple
+    out_path = Path(out_dir) / (Path(f).stem.replace(".nii", "") + ".npy")
+    if out_path.exists():
+        return (str(f), "skip:exists")
+    try:
+        img = nib.load(str(f))
+        arr = np.asanyarray(img.dataobj)
+        spacing = tuple(float(s) for s in img.header.get_zooms()[:3])
+
+        binary = _binarise(arr, keep_label)
+        if binary.sum() < 1000:
+            return (str(f), "skip:empty")
+
+        iso = resample_iso(binary, spacing)
+        cropped, _ = crop_to_content(iso)
+        canonical, _ = canonicalize(cropped, grid_size=grid)
+        np.save(out_path, canonical.astype(np.float32))
+        return (str(f), None)
+    except Exception as exc:
+        return (str(f), f"error:{exc}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--in-dir", type=str, required=True)
@@ -46,6 +73,12 @@ def main():
         help="Keep only this label value (1=sacrum, 2=L-hip, 3=R-hip in CTPelvic1K)",
     )
     p.add_argument("--grid", type=int, default=VOXEL_SIZE)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=min(4, os.cpu_count() or 1),
+        help="Parallel worker processes (default: min(4, cpu_count))",
+    )
     args = p.parse_args()
 
     ensure_dirs()
@@ -57,27 +90,27 @@ def main():
     if not files:
         raise SystemExit(f"No NIfTI files under {in_dir}")
 
-    skipped = 0
-    for f in tqdm(files, desc="prepare"):
-        try:
-            img = nib.load(str(f))
-            arr = np.asanyarray(img.dataobj)
-            spacing = tuple(float(s) for s in img.header.get_zooms()[:3])
+    print(f"[prepare] {len(files)} files  label={args.label}  workers={args.workers}  out={out_dir}")
 
-            binary = _binarise(arr, args.label)
-            if binary.sum() < 1000:
-                skipped += 1
-                continue
+    tasks = [(str(f), str(out_dir), args.label, args.grid) for f in files]
+    written = skipped = errors = 0
 
-            iso = resample_iso(binary, spacing)
-            cropped, _ = crop_to_content(iso)
-            canonical, _ = canonicalize(cropped, grid_size=args.grid)
-            np.save(out_dir / (f.stem.replace(".nii", "") + ".npy"), canonical.astype(np.float32))
-        except Exception as exc:
-            print(f"[warn] {f}: {exc}")
-            skipped += 1
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_process_one, t): t[0] for t in tasks}
+        with tqdm(total=len(files), desc="prepare") as bar:
+            for fut in as_completed(futures):
+                _, result = fut.result()
+                if result is None:
+                    written += 1
+                elif result.startswith("skip"):
+                    skipped += 1
+                else:
+                    errors += 1
+                    print(f"\n[warn] {futures[fut]}: {result}")
+                bar.update(1)
+                bar.set_postfix(written=written, skipped=skipped, errors=errors)
 
-    print(f"[done] wrote {len(files) - skipped} volumes to {out_dir} (skipped {skipped})")
+    print(f"[done] written={written}  skipped={skipped}  errors={errors}  out={out_dir}")
 
 
 if __name__ == "__main__":
