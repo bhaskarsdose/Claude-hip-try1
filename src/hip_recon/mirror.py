@@ -58,6 +58,7 @@ def mirror_reconstruct(
     mirror_axis: int = 0,
     grid_size: int = 256,
     dilate_input: int = 3,
+    cleanup_iters: int = 3,
     smooth_iters: int = 12,
     keep_largest: bool = True,
 ) -> MirrorResult:
@@ -73,6 +74,10 @@ def mirror_reconstruct(
         dilate_input: voxels to dilate the defective input before subtraction,
             so the implant cleanly butts against existing bone instead of
             overlapping it.
+        cleanup_iters: morphological-opening iterations applied to the implant
+            volume. Higher values sever thin "fingers" that connect peripheral
+            bits to the main implant body. 1 = minimal cleanup, 3 = clean,
+            5 = aggressive (only the central reconstruction survives).
         smooth_iters: Taubin smoothing iterations on the final implant mesh.
         keep_largest: drop disconnected fragments (small floating noise specks
             from the boolean), keeping only the largest connected component.
@@ -152,8 +157,10 @@ def mirror_reconstruct(
     if dilate_input > 0:
         def_vol = ndi.binary_dilation(def_vol, iterations=dilate_input)
     implant_vol = mir_vol & ~def_vol
-    # Strip tiny disconnected speckle
-    implant_vol = ndi.binary_opening(implant_vol, iterations=1)
+    # Erode + dilate (binary_opening) severs thin necks connecting peripheral
+    # shards to the main implant, then restores volume of the main body.
+    if cleanup_iters > 0:
+        implant_vol = ndi.binary_opening(implant_vol, iterations=cleanup_iters)
 
     if implant_vol.sum() == 0:
         print("[mirror] empty implant — try a different mirror_axis or check alignment")
