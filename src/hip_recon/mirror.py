@@ -172,3 +172,83 @@ def mirror_reconstruct(
             pass
 
     return MirrorResult(defective, mirrored, implant_mesh, pitch)
+
+
+def detect_acetabulum(
+    hip_mesh: trimesh.Trimesh,
+    deep_percentile: float = 85.0,
+    min_points: int = 20,
+) -> tuple[np.ndarray, float]:
+    """Estimate acetabular centre and radius from a healthy hip mesh.
+
+    The acetabulum is the largest concavity on the bone surface (the cup that
+    cradles the femoral head). We find it by:
+      1. Computing the convex hull
+      2. Measuring each vertex's distance to the hull surface
+      3. Taking the deepest 15% as the cup region
+      4. Centroid + median-distance fit gives center + radius
+
+    Returns (center_xyz, radius_mm). Adult femoral head radii are 22-26 mm
+    so we clamp the returned radius to that range.
+    """
+    hull = hip_mesh.convex_hull
+    closest, dists, _ = trimesh.proximity.closest_point(hull, hip_mesh.vertices)
+    threshold = np.percentile(dists, deep_percentile)
+    deep_pts = hip_mesh.vertices[dists > threshold]
+    if len(deep_pts) < min_points:
+        return hip_mesh.centroid, 24.0
+    centre = deep_pts.mean(axis=0)
+    radius = float(np.median(np.linalg.norm(deep_pts - centre, axis=1)))
+    return centre, float(np.clip(radius, 20.0, 28.0))
+
+
+def add_femoral_socket(
+    implant_mesh: trimesh.Trimesh,
+    centre: np.ndarray,
+    radius: float = 24.0,
+    pitch: float | None = None,
+    smooth_iters: int = 6,
+) -> trimesh.Trimesh:
+    """Carve a hemispherical socket into the implant for the femoral head.
+
+    Args:
+        implant_mesh: bone-shape implant from mirror_reconstruct.
+        centre: world-space centre of the acetabular cup (3,).
+        radius: femoral head radius in mm (typical adult: 22-26).
+        pitch: voxel pitch for the boolean. Defaults to radius / 24.
+        smooth_iters: Taubin smoothing on the modified implant.
+    """
+    if implant_mesh.is_empty:
+        return implant_mesh
+    if pitch is None:
+        pitch = max(radius / 24.0, 0.4)
+
+    sphere = trimesh.creation.icosphere(subdivisions=4, radius=radius)
+    sphere.apply_translation(np.asarray(centre, dtype=float))
+
+    bmin = np.minimum(implant_mesh.bounds[0], sphere.bounds[0]) - 2.0
+    bmax = np.maximum(implant_mesh.bounds[1], sphere.bounds[1]) + 2.0
+    shape = np.ceil((bmax - bmin) / pitch).astype(int)
+
+    impl_vol = _voxelize_to_grid(implant_mesh, pitch, bmin, shape)
+    sph_vol = _voxelize_to_grid(sphere, pitch, bmin, shape)
+
+    result_vol = impl_vol & ~sph_vol
+    result_vol = ndi.binary_opening(result_vol, iterations=1)
+    if result_vol.sum() == 0:
+        return implant_mesh
+
+    padded = np.pad(result_vol.astype(np.uint8), 1)
+    verts, faces, _, _ = measure.marching_cubes(padded, level=0.5)
+    verts -= 1.0
+    verts = verts * pitch + bmin
+    faces = faces[:, ::-1]
+    out = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+    if smooth_iters > 0 and len(out.vertices) > 0:
+        try:
+            trimesh.smoothing.filter_taubin(
+                out, lamb=0.5, nu=-0.53, iterations=smooth_iters
+            )
+        except Exception:
+            pass
+    return out
