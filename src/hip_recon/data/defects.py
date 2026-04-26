@@ -93,10 +93,44 @@ def random_plane_cut(
     return defective.astype(np.float32), implant.astype(np.float32)
 
 
+def random_slab_defect(
+    volume: np.ndarray,
+    thickness_range: tuple[float, float] = (0.25, 0.55),
+    rng: Rng | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove a slab through the middle of the bone (two parallel planes).
+
+    Models pelvic-discontinuity / massive-osteolysis cases where the central
+    region is gone and only two end pieces remain — disconnected.
+    """
+    rng = rng or np.random.default_rng()
+    coords = np.argwhere(volume > 0)
+    if coords.size == 0:
+        return volume.copy(), np.zeros_like(volume)
+    centroid = coords.mean(axis=0)
+    n = rng.normal(size=3)
+    n /= np.linalg.norm(n) + 1e-8
+    extents = coords.max(axis=0) - coords.min(axis=0)
+    span = float(extents.max())
+    thickness = rng.uniform(*thickness_range) * span
+    offset = rng.uniform(-0.15, 0.15) * span
+
+    zz, yy, xx = np.indices(volume.shape)
+    rel = np.stack(
+        [zz - centroid[0], yy - centroid[1], xx - centroid[2]], axis=-1
+    )
+    proj = rel @ n
+    in_slab = (proj > offset - thickness / 2) & (proj < offset + thickness / 2)
+    implant = (volume > 0) & in_slab
+    defective = (volume > 0) & ~implant
+    return defective.astype(np.float32), implant.astype(np.float32)
+
+
 DEFECT_FNS = {
     "sphere": random_sphere_defect,
     "box": random_box_defect,
     "plane": random_plane_cut,
+    "slab": random_slab_defect,
 }
 
 

@@ -111,6 +111,12 @@ def main():
         action="store_true",
         help="Enable torch.compile (faster but unstable with AMP — can cause NaN cascades)",
     )
+    p.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to a checkpoint to load as starting weights (fine-tuning)",
+    )
     args = p.parse_args()
 
     cfg = TrainConfig()
@@ -136,6 +142,12 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     model = build_unet(cfg).to(device)
+
+    # Optional fine-tuning from a previous checkpoint
+    if args.resume:
+        from .models.unet3d import load_checkpoint
+        load_checkpoint(model, args.resume, map_location=device)
+        print(f"[train] resumed from {args.resume}")
 
     # torch.compile is opt-in: it gives 20-40% throughput on A100 but combined
     # with AMP + clip_grad it can leak Inf gradients past the scaler and
