@@ -14,6 +14,7 @@ import argparse
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from monai.losses import DiceLoss
 from torch.utils.data import DataLoader, random_split
@@ -48,13 +49,28 @@ def build_loaders(args, cfg: TrainConfig):
     if args.smoke:
         ds = SyntheticEllipsoidDataset(n=8)
         n_val = 2
+        n_train = len(ds) - n_val
+        train_ds, val_ds = random_split(
+            ds, [n_train, n_val], generator=torch.Generator().manual_seed(0)
+        )
     else:
-        ds = HipDefectDataset(args.data_dir, augment=True)
-        n_val = max(1, int(len(ds) * cfg.val_fraction))
-    n_train = len(ds) - n_val
-    train_ds, val_ds = random_split(
-        ds, [n_train, n_val], generator=torch.Generator().manual_seed(0)
-    )
+        # Split file list deterministically, then build separate datasets so
+        # train can augment + use random defects while val stays deterministic.
+        all_files = sorted(Path(args.data_dir).glob("*.npy"))
+        if not all_files:
+            raise FileNotFoundError(f"No .npy under {args.data_dir}")
+        rng = np.random.default_rng(0)
+        idx = rng.permutation(len(all_files))
+        n_val = max(1, int(len(all_files) * cfg.val_fraction))
+        val_files = [all_files[i] for i in idx[:n_val]]
+        train_files = [all_files[i] for i in idx[n_val:]]
+        train_ds = HipDefectDataset(
+            args.data_dir, files=train_files, augment=True, deterministic=False
+        )
+        val_ds = HipDefectDataset(
+            args.data_dir, files=val_files, augment=False, deterministic=True
+        )
+        print(f"[train] split: train={len(train_ds)}  val={len(val_ds)}")
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
@@ -78,6 +94,7 @@ def main():
     p.add_argument("--out", type=str, default=str(CHECKPOINT_PATH))
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--no-amp", action="store_true", help="Disable mixed-precision (use if val_dice stays 0)")
+    p.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
     args = p.parse_args()
 
     cfg = TrainConfig()
@@ -89,6 +106,8 @@ def main():
         cfg.lr = args.lr
     if args.no_amp:
         cfg.amp = False
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
     if args.smoke:
         cfg.epochs = min(cfg.epochs, 3)
         cfg.batch_size = 1

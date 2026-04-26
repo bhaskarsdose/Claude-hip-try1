@@ -76,7 +76,13 @@ class SyntheticEllipsoidDataset(Dataset):
 
 
 class HipDefectDataset(Dataset):
-    """Loads pre-processed 128**3 hip volumes and produces defects on-the-fly."""
+    """Loads pre-processed 128**3 hip volumes and produces defects on-the-fly.
+
+    `deterministic=True` (used for validation) seeds the per-sample RNG from
+    the file index alone, so every epoch sees the same defect on the same
+    file. Without this, val_dice oscillates randomly because each epoch
+    re-rolls the defect cut on the val files.
+    """
 
     def __init__(
         self,
@@ -84,9 +90,14 @@ class HipDefectDataset(Dataset):
         augment: bool = True,
         grid: int = VOXEL_SIZE,
         seed: int = 0,
+        files: list[Path] | None = None,
+        deterministic: bool = False,
     ):
         self.root = Path(root)
-        self.files = sorted(self.root.glob("*.npy"))
+        if files is not None:
+            self.files = list(files)
+        else:
+            self.files = sorted(self.root.glob("*.npy"))
         if not self.files:
             raise FileNotFoundError(
                 f"No .npy volumes found in {self.root}. "
@@ -95,6 +106,8 @@ class HipDefectDataset(Dataset):
         self.augment = augment
         self.grid = grid
         self.rng = np.random.default_rng(seed)
+        self.deterministic = deterministic
+        self.seed = seed
 
     def __len__(self) -> int:
         return len(self.files)
@@ -105,7 +118,11 @@ class HipDefectDataset(Dataset):
             raise ValueError(
                 f"Expected {(self.grid,) * 3}, got {complete.shape} for {self.files[idx]}"
             )
-        rng = np.random.default_rng(self.rng.integers(0, 2**31 - 1))
+        if self.deterministic:
+            # Same defect for the same file every epoch
+            rng = np.random.default_rng(self.seed * 100003 + idx)
+        else:
+            rng = np.random.default_rng(self.rng.integers(0, 2**31 - 1))
         if self.augment:
             complete = _augment(complete, rng)
         defective, _, _ = random_defect(complete, rng=rng)
