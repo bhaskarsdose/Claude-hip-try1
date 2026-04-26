@@ -106,6 +106,11 @@ def main():
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--no-amp", action="store_true", help="Disable mixed-precision (use if val_dice stays 0)")
     p.add_argument("--num-workers", type=int, default=None, help="DataLoader worker processes")
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile (faster but unstable with AMP — can cause NaN cascades)",
+    )
     args = p.parse_args()
 
     cfg = TrainConfig()
@@ -132,13 +137,15 @@ def main():
 
     model = build_unet(cfg).to(device)
 
-    # torch.compile gives 20-40% throughput improvement on A100/L4 (PyTorch 2+)
-    if hasattr(torch, "compile") and device.type == "cuda":
+    # torch.compile is opt-in: it gives 20-40% throughput on A100 but combined
+    # with AMP + clip_grad it can leak Inf gradients past the scaler and
+    # corrupt the model weights into a NaN cascade. Pass --compile to enable.
+    if args.compile and hasattr(torch, "compile") and device.type == "cuda":
         try:
             model = torch.compile(model)
             print("[train] torch.compile enabled")
-        except Exception:
-            pass  # silently skip on unsupported builds
+        except Exception as exc:
+            print(f"[train] torch.compile failed: {exc}")
 
     loss_fn = DiceBCE().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -169,13 +176,21 @@ def main():
             ):
                 logits = model(defective)
                 loss = loss_fn(logits, complete)
-            if torch.isnan(loss):
-                print(f"[warn] NaN loss at step {step} — skipping batch")
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[warn] non-finite loss at step {step} — skipping batch")
                 continue
             scaler.scale(loss).backward()
             # Unscale before clipping so the clip threshold is in true gradient units
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Check that gradients are finite before clipping. If any param has
+            # NaN/Inf gradient, skip the step entirely — otherwise clip_grad_norm
+            # may propagate the NaN through every parameter and corrupt weights.
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if not torch.isfinite(grad_norm):
+                print(f"[warn] non-finite gradient norm at step {step} — skipping step")
+                opt.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
             scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
@@ -189,6 +204,21 @@ def main():
 
         avg_loss = epoch_loss / max(len(train_loader), 1)
         writer.add_scalar("train/epoch_loss", avg_loss, epoch)
+
+        # Detect corrupted weights and roll back to last-best checkpoint.
+        weights_ok = all(torch.isfinite(p).all().item() for p in model.parameters())
+        if not weights_ok:
+            print(f"[warn] model weights have NaN/Inf — restoring from {args.out}")
+            if Path(args.out).is_file():
+                from .models.unet3d import load_checkpoint
+                load_checkpoint(model, args.out, map_location=device)
+                # halve LR after corruption to avoid repeating it
+                for g in opt.param_groups:
+                    g["lr"] *= 0.5
+                print(f"[recover] restored; lr={opt.param_groups[0]['lr']:.2e}")
+            else:
+                print("[fatal] no checkpoint to restore from — stopping")
+                break
 
         # Validation
         model.eval()
