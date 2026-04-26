@@ -71,15 +71,26 @@ def build_loaders(args, cfg: TrainConfig):
             args.data_dir, files=val_files, augment=False, deterministic=True
         )
         print(f"[train] split: train={len(train_ds)}  val={len(val_ds)}")
+    # persistent_workers keeps worker processes alive between epochs (avoids
+    # repeated fork overhead). prefetch_factor=2 queues up the next batch
+    # while the GPU is busy with the current one.
+    use_persistent = cfg.num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
         shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if use_persistent else None,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=1, shuffle=False, num_workers=cfg.num_workers
+        val_ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if use_persistent else None,
     )
     return train_loader, val_loader
 
@@ -115,16 +126,33 @@ def main():
 
     ensure_dirs()
     device = torch.device(args.device)
+
+    # Let cuDNN auto-tune kernels for fixed 128³ input size (~5% speedup)
+    torch.backends.cudnn.benchmark = True
+
     model = build_unet(cfg).to(device)
+
+    # torch.compile gives 20-40% throughput improvement on A100/L4 (PyTorch 2+)
+    if hasattr(torch, "compile") and device.type == "cuda":
+        try:
+            model = torch.compile(model)
+            print("[train] torch.compile enabled")
+        except Exception:
+            pass  # silently skip on unsupported builds
+
     loss_fn = DiceBCE().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == "cuda")
 
     train_loader, val_loader = build_loaders(args, cfg)
 
+    gpu_mem = ""
+    if device.type == "cuda":
+        total_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
+        gpu_mem = f"  gpu_mem={total_gb:.0f}GB"
     run_dir = RUNS_DIR / time.strftime("%Y%m%d-%H%M%S")
     writer = SummaryWriter(log_dir=str(run_dir))
-    print(f"[train] device={device} epochs={cfg.epochs} runs={run_dir}")
+    print(f"[train] device={device}{gpu_mem}  epochs={cfg.epochs}  batch={cfg.batch_size}  amp={cfg.amp}")
 
     step = 0
     best_dice = 0.0
