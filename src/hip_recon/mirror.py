@@ -181,25 +181,78 @@ def detect_acetabulum(
 ) -> tuple[np.ndarray, float]:
     """Estimate acetabular centre and radius from a healthy hip mesh.
 
-    The acetabulum is the largest concavity on the bone surface (the cup that
-    cradles the femoral head). We find it by:
-      1. Computing the convex hull
-      2. Measuring each vertex's distance to the hull surface
-      3. Taking the deepest 15% as the cup region
-      4. Centroid + median-distance fit gives center + radius
+    The acetabulum is the cup that cradles the femoral head. It's a deep
+    concavity that **opens laterally** (away from the body midline). We
+    disambiguate it from the iliac fossa (smooth medial concavity) by
+    requiring vertices to face away from the bone's main mass.
 
-    Returns (center_xyz, radius_mm). Adult femoral head radii are 22-26 mm
-    so we clamp the returned radius to that range.
+    Algorithm:
+      1. Compute convex hull, measure each vertex's distance to the hull.
+      2. Take the deepest 15% of vertices.
+      3. Cluster those by spatial proximity; pick the cluster whose mean
+         normal points furthest away from the bone centroid (= laterally
+         outward), which selects the acetabulum over the iliac fossa.
+      4. Centroid + median radius gives cup centre + size.
+
+    Returns (centre_xyz, radius_mm). Radius clamped to physiological 20-28 mm.
     """
     hull = hip_mesh.convex_hull
-    closest, dists, _ = trimesh.proximity.closest_point(hull, hip_mesh.vertices)
+    _closest, dists, _ = trimesh.proximity.closest_point(hull, hip_mesh.vertices)
     threshold = np.percentile(dists, deep_percentile)
-    deep_pts = hip_mesh.vertices[dists > threshold]
-    if len(deep_pts) < min_points:
+    deep_idx = np.where(dists > threshold)[0]
+    if len(deep_idx) < min_points:
         return hip_mesh.centroid, 24.0
-    centre = deep_pts.mean(axis=0)
-    radius = float(np.median(np.linalg.norm(deep_pts - centre, axis=1)))
-    return centre, float(np.clip(radius, 20.0, 28.0))
+    deep_pts = hip_mesh.vertices[deep_idx]
+    deep_normals = hip_mesh.vertex_normals[deep_idx]
+
+    # Cluster the deep vertices spatially. Use simple connectivity via DBSCAN-like
+    # approach: KDTree + connected components on a radius graph.
+    from scipy.spatial import cKDTree
+    tree = cKDTree(deep_pts)
+    cluster_radius = max(8.0, np.linalg.norm(hip_mesh.extents) * 0.05)
+    pairs = tree.query_pairs(r=cluster_radius)
+    n = len(deep_pts)
+    # Union-find on cluster pairs
+    parent = list(range(n))
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    for a, b in pairs:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    roots = np.array([find(i) for i in range(n)])
+    unique_roots, sizes = np.unique(roots, return_counts=True)
+    # Score each cluster: prefer (a) large, (b) facing away from bone centroid
+    bone_centroid = hip_mesh.centroid
+    best_score = -np.inf
+    best_centre = deep_pts.mean(axis=0)
+    best_radius = 24.0
+    for root, size in zip(unique_roots, sizes):
+        if size < 5:
+            continue
+        mask = roots == root
+        cluster_pts = deep_pts[mask]
+        cluster_normals = deep_normals[mask]
+        cluster_centre = cluster_pts.mean(axis=0)
+        # Outward direction = away from bone centroid
+        outward = cluster_centre - bone_centroid
+        outward /= np.linalg.norm(outward) + 1e-8
+        # Mean normal of the cluster should point in same direction (concavity opens outward)
+        mean_normal = cluster_normals.mean(axis=0)
+        mean_normal /= np.linalg.norm(mean_normal) + 1e-8
+        # Note: surface normals point outward from the bone. For a concavity
+        # that opens laterally, the surface normals point laterally too.
+        outward_score = float(mean_normal @ outward)
+        # Combine: prefer outward-facing AND reasonably large
+        score = outward_score * np.log1p(size)
+        if score > best_score:
+            best_score = score
+            best_centre = cluster_centre
+            best_radius = float(np.median(np.linalg.norm(cluster_pts - cluster_centre, axis=1)))
+    return best_centre, float(np.clip(best_radius, 20.0, 28.0))
 
 
 def add_femoral_socket(
@@ -208,6 +261,7 @@ def add_femoral_socket(
     radius: float = 24.0,
     pitch: float | None = None,
     smooth_iters: int = 6,
+    keep_largest: bool = True,
 ) -> trimesh.Trimesh:
     """Carve a hemispherical socket into the implant for the femoral head.
 
@@ -217,6 +271,8 @@ def add_femoral_socket(
         radius: femoral head radius in mm (typical adult: 22-26).
         pitch: voxel pitch for the boolean. Defaults to radius / 24.
         smooth_iters: Taubin smoothing on the modified implant.
+        keep_largest: drop disconnected fragments left over from the boolean,
+            keeping only the largest connected component.
     """
     if implant_mesh.is_empty:
         return implant_mesh
@@ -237,6 +293,14 @@ def add_femoral_socket(
     result_vol = ndi.binary_opening(result_vol, iterations=1)
     if result_vol.sum() == 0:
         return implant_mesh
+
+    if keep_largest:
+        # Keep only the largest connected component to remove fragments
+        labels, n = ndi.label(result_vol)
+        if n > 1:
+            sizes = ndi.sum(result_vol, labels, range(1, n + 1))
+            largest = int(np.argmax(sizes)) + 1
+            result_vol = labels == largest
 
     padded = np.pad(result_vol.astype(np.uint8), 1)
     verts, faces, _, _ = measure.marching_cubes(padded, level=0.5)
