@@ -163,6 +163,7 @@ def main():
 
     step = 0
     best_dice = 0.0
+    consecutive_nans = 0
     for epoch in range(cfg.epochs):
         model.train()
         epoch_loss = 0.0
@@ -177,24 +178,36 @@ def main():
                 logits = model(defective)
                 loss = loss_fn(logits, complete)
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[warn] non-finite loss at step {step} — skipping batch")
+                consecutive_nans += 1
+                if consecutive_nans <= 3:
+                    print(f"[warn] non-finite loss at step {step} — skipping batch")
+                # If we get a string of NaN losses, the model is corrupted —
+                # recover from the last best checkpoint immediately rather than
+                # waiting for the epoch to end.
+                if consecutive_nans >= 5 and Path(args.out).is_file():
+                    print(f"[recover] {consecutive_nans} consecutive NaN — restoring from {args.out}")
+                    from .models.unet3d import load_checkpoint
+                    load_checkpoint(model, args.out, map_location=device)
+                    for g in opt.param_groups:
+                        g["lr"] *= 0.5
+                    print(f"[recover] lr={opt.param_groups[0]['lr']:.2e}")
+                    consecutive_nans = 0
+                step += 1
                 continue
+            consecutive_nans = 0
             scaler.scale(loss).backward()
             # Unscale before clipping so the clip threshold is in true gradient units
             scaler.unscale_(opt)
-            # Check that gradients are finite before clipping. If any param has
-            # NaN/Inf gradient, skip the step entirely — otherwise clip_grad_norm
-            # may propagate the NaN through every parameter and corrupt weights.
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if not torch.isfinite(grad_norm):
                 print(f"[warn] non-finite gradient norm at step {step} — skipping step")
                 opt.zero_grad(set_to_none=True)
                 scaler.update()
+                step += 1
                 continue
             scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
-            # Detect AMP-skipped steps (scale drops when inf/NaN gradients were found)
             if scaler.get_scale() < scale_before:
                 n_skipped += 1
             epoch_loss += loss.item()
