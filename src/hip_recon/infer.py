@@ -1,4 +1,4 @@
-"""End-to-end inference: NIfTI mask in -> implant STL out.
+"""End-to-end inference: NIfTI mask or STL mesh in -> implant STL out.
 
 If no checkpoint is available we fall back to a no-op "placeholder" model so
 the web stack is fully runnable before training completes. The web app uses
@@ -25,6 +25,8 @@ from .data.preprocessing import (
     voxels_to_mesh,
 )
 from .models.unet3d import build_unet, load_checkpoint
+
+_MESH_SUFFIXES = {".stl", ".ply", ".obj", ".glb", ".gltf"}
 
 
 @dataclass
@@ -73,14 +75,10 @@ def _predict(model: torch.nn.Module, device: torch.device, canonical: np.ndarray
     return (prob > 0.5).astype(np.float32)
 
 
-def reconstruct_from_nifti(
-    nifti_path: str | Path, grid: int = VOXEL_SIZE
+def _run_pipeline(
+    canonical_input: np.ndarray, grid: int = VOXEL_SIZE
 ) -> ReconstructionResult:
-    volume, _affine, spacing = load_nifti(nifti_path)
-    iso = resample_iso(volume, spacing)
-    cropped, _ = crop_to_content(iso)
-    canonical_input, _xform = canonicalize(cropped, grid_size=grid)
-
+    """Shared prediction + implant extraction for any input source."""
     model, device, used_trained = _get_model()
     canonical_pred = _predict(model, device, canonical_input)
 
@@ -103,3 +101,57 @@ def reconstruct_from_nifti(
         canonical_input=canonical_input,
         canonical_pred=canonical_pred,
     )
+
+
+def reconstruct_from_nifti(
+    nifti_path: str | Path, grid: int = VOXEL_SIZE
+) -> ReconstructionResult:
+    volume, _affine, spacing = load_nifti(nifti_path)
+    iso = resample_iso(volume, spacing)
+    cropped, _ = crop_to_content(iso)
+    canonical_input, _xform = canonicalize(cropped, grid_size=grid)
+    return _run_pipeline(canonical_input, grid=grid)
+
+
+def reconstruct_from_stl(
+    stl_path: str | Path, grid: int = VOXEL_SIZE
+) -> ReconstructionResult:
+    """Accept any triangle mesh (STL / PLY / OBJ) and run shape completion.
+
+    The mesh is voxelised at a pitch chosen so that the longest bounding-box
+    axis maps to ~120 voxels, then processed identically to the NIfTI path.
+    Medical STLs from TotalSegmentator are in mm, but any consistent unit works
+    because canonicalize() normalises the scale.
+    """
+    mesh = trimesh.load(str(stl_path), force="mesh", process=True)
+    if mesh.is_empty or len(mesh.vertices) == 0:
+        raise ValueError(f"Could not load a valid mesh from {stl_path}")
+
+    extents = mesh.bounding_box.extents
+    max_extent = float(extents.max())
+    if max_extent == 0:
+        raise ValueError("Mesh has zero extent — check the STL file.")
+
+    pitch = max_extent / 120.0
+    vg = mesh.voxelized(pitch).fill()
+    volume = vg.matrix.astype(np.float32)
+
+    cropped, _ = crop_to_content(volume)
+    canonical_input, _xform = canonicalize(cropped, grid_size=grid)
+    return _run_pipeline(canonical_input, grid=grid)
+
+
+def reconstruct(path: str | Path, grid: int = VOXEL_SIZE) -> ReconstructionResult:
+    """Auto-detect input format by file extension and run reconstruction.
+
+    Accepts NIfTI masks (`.nii`, `.nii.gz`) and triangle meshes (`.stl`,
+    `.ply`, `.obj`).
+    """
+    p = Path(path)
+    suffix = p.suffix.lower()
+    # Handle double extension like .nii.gz
+    if suffix == ".gz" and p.stem.endswith(".nii"):
+        suffix = ".nii"
+    if suffix in _MESH_SUFFIXES:
+        return reconstruct_from_stl(p, grid=grid)
+    return reconstruct_from_nifti(p, grid=grid)
