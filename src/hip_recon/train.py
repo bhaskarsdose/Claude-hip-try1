@@ -77,6 +77,7 @@ def main():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--out", type=str, default=str(CHECKPOINT_PATH))
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--no-amp", action="store_true", help="Disable mixed-precision (use if val_dice stays 0)")
     args = p.parse_args()
 
     cfg = TrainConfig()
@@ -86,6 +87,8 @@ def main():
         cfg.batch_size = args.batch_size
     if args.lr is not None:
         cfg.lr = args.lr
+    if args.no_amp:
+        cfg.amp = False
     if args.smoke:
         cfg.epochs = min(cfg.epochs, 3)
         cfg.batch_size = 1
@@ -108,7 +111,9 @@ def main():
     best_dice = 0.0
     for epoch in range(cfg.epochs):
         model.train()
-        for defective, complete in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
+        epoch_loss = 0.0
+        n_skipped = 0  # AMP optimizer-skip counter
+        for defective, complete in tqdm(train_loader, desc=f"epoch {epoch:03d}", leave=False):
             defective = defective.to(device, non_blocking=True)
             complete = complete.to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
@@ -117,12 +122,26 @@ def main():
             ):
                 logits = model(defective)
                 loss = loss_fn(logits, complete)
+            if torch.isnan(loss):
+                print(f"[warn] NaN loss at step {step} — skipping batch")
+                continue
             scaler.scale(loss).backward()
+            # Unscale before clipping so the clip threshold is in true gradient units
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
+            # Detect AMP-skipped steps (scale drops when inf/NaN gradients were found)
+            if scaler.get_scale() < scale_before:
+                n_skipped += 1
+            epoch_loss += loss.item()
             if step % cfg.log_every == 0:
                 writer.add_scalar("train/loss", loss.item(), step)
             step += 1
+
+        avg_loss = epoch_loss / max(len(train_loader), 1)
+        writer.add_scalar("train/epoch_loss", avg_loss, epoch)
 
         # Validation
         model.eval()
@@ -137,12 +156,13 @@ def main():
             dices.append(dice_score(logits, complete))
         val_dice = sum(dices) / max(len(dices), 1)
         writer.add_scalar("val/dice", val_dice, epoch)
-        print(f"[epoch {epoch}] val_dice={val_dice:.4f}")
+        skip_info = f"  amp_skipped={n_skipped}" if n_skipped else ""
+        print(f"[epoch {epoch:03d}] train_loss={avg_loss:.4f}  val_dice={val_dice:.4f}{skip_info}")
 
         if val_dice > best_dice:
             best_dice = val_dice
             save_checkpoint(model, Path(args.out), epoch=epoch, val_dice=val_dice, cfg=vars(cfg))
-            print(f"[save] best -> {args.out}  dice={best_dice:.4f}")
+            print(f"  -> saved best checkpoint  dice={best_dice:.4f}")
 
     # Always save a final checkpoint, even on smoke runs where val_dice may
     # never improve over the initial value.
