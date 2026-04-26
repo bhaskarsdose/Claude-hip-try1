@@ -90,15 +90,50 @@ def mirror_reconstruct(
     # 2. Coarse alignment via centroid translation
     mirrored.apply_translation(defective.centroid - mirrored.centroid)
 
-    # 3. Refine alignment with ICP from mirrored -> defective
+    # 3. Refine with multi-pass ICP from defective -> mirrored.
+    #
+    # Why this direction: every defective vertex lies on intact bone, so each
+    # one has a real correspondence on the full healthy mirrored mesh. The
+    # opposite direction (mirrored -> defective) sends ~40% of points (the
+    # ones over the missing region) to wrong nearest neighbours, biasing the
+    # transform — that's what caused the misalignment in the first version.
+    #
+    # We run two passes and reject outliers between them so any thin sliver
+    # bone in the defective mesh that still doesn't have a clean match
+    # (e.g. the narrow remaining bridge through the defect) doesn't drag
+    # alignment.
     try:
-        matrix, _aligned_verts, _cost = trimesh.registration.icp(
-            np.asarray(mirrored.vertices, dtype=np.float64),
-            np.asarray(defective.vertices, dtype=np.float64),
-            max_iterations=80,
-            scale=False,
+        # Subsample for speed: 5k points are plenty for a hip
+        defective_pts = np.asarray(defective.vertices, dtype=np.float64)
+        mirrored_pts = np.asarray(mirrored.vertices, dtype=np.float64)
+        if len(defective_pts) > 5000:
+            sel = np.random.default_rng(0).choice(len(defective_pts), 5000, replace=False)
+            defective_pts = defective_pts[sel]
+
+        # Pass 1: full point set
+        M1, _aligned, _ = trimesh.registration.icp(
+            defective_pts, mirrored_pts, max_iterations=60, scale=False,
         )
-        mirrored.apply_transform(matrix)
+        # Find which defective points matched well (within median distance)
+        aligned1 = (M1 @ np.c_[defective_pts, np.ones(len(defective_pts))].T).T[:, :3]
+        from scipy.spatial import cKDTree
+        tree = cKDTree(mirrored_pts)
+        dists, _ = tree.query(aligned1, k=1)
+        keep = dists < np.percentile(dists, 80)  # drop worst 20% as outliers
+
+        # Pass 2: refined alignment using only inliers
+        if keep.sum() > 100:
+            M2, _, _ = trimesh.registration.icp(
+                defective_pts[keep], mirrored_pts,
+                initial=M1, max_iterations=60, scale=False,
+            )
+            matrix = M2
+        else:
+            matrix = M1
+
+        # We aligned defective -> mirrored. Apply the inverse to mirrored
+        # so it lands on the defective bone in its original coordinates.
+        mirrored.apply_transform(np.linalg.inv(matrix))
     except Exception as exc:
         print(f"[mirror] ICP failed ({exc}); using centroid-only alignment")
 
