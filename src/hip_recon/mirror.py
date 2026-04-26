@@ -59,6 +59,7 @@ def mirror_reconstruct(
     grid_size: int = 256,
     dilate_input: int = 3,
     smooth_iters: int = 12,
+    keep_largest: bool = True,
 ) -> MirrorResult:
     """Reconstruct a unilateral defect by mirroring the contralateral side.
 
@@ -73,6 +74,8 @@ def mirror_reconstruct(
             so the implant cleanly butts against existing bone instead of
             overlapping it.
         smooth_iters: Taubin smoothing iterations on the final implant mesh.
+        keep_largest: drop disconnected fragments (small floating noise specks
+            from the boolean), keeping only the largest connected component.
     """
     defective = trimesh.load(str(defective_path), force="mesh", process=True)
     healthy = trimesh.load(str(healthy_path), force="mesh", process=True)
@@ -155,6 +158,15 @@ def mirror_reconstruct(
     if implant_vol.sum() == 0:
         print("[mirror] empty implant — try a different mirror_axis or check alignment")
         return MirrorResult(defective, mirrored, trimesh.Trimesh(), pitch)
+
+    # Drop disconnected fragments — they're voxel-level noise from the boolean,
+    # not real anatomy. Keeps only the largest connected component.
+    if keep_largest:
+        labels, n = ndi.label(implant_vol)
+        if n > 1:
+            sizes = ndi.sum(implant_vol, labels, range(1, n + 1))
+            largest = int(np.argmax(sizes)) + 1
+            implant_vol = labels == largest
 
     # 5. Mesh the implant volume back to world coordinates
     padded = np.pad(implant_vol.astype(np.uint8), 1)
